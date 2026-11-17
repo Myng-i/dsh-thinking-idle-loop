@@ -68,6 +68,7 @@ const rows = reas.map((r, i) => {
     frags: frags.length,
     density: r.text.length ? (frags.length / r.text.length) * 1000 : 0,
     top: [...new Set(frags)].slice(0, 6),
+    fragList: frags,
   };
 });
 
@@ -77,7 +78,7 @@ for (const x of rows) {
   a.n += 1;
   a.len += x.len;
   a.frag += x.frags;
-  for (const f of x.top) a.samples.set(f, (a.samples.get(f) || 0) + 1);
+  for (const f of x.fragList) a.samples.set(f, (a.samples.get(f) || 0) + 1);
   byTurn.set(x.turn, a);
 }
 console.log('turn  块数  总字符  碎片数  密度(‰)  高频碎片');
