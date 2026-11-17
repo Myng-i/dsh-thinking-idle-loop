@@ -1,0 +1,4 @@
+{"at":1791724283423,"kind":"short-line-repeat","action":"cancel","reason":"最近 55 个短行里有 30 行是「```」","detail":{"windowLines":55,"repeat":30,"sample":"```"},"tail":"（示例：命中时的最近若干行思考原文，真实账本里约 500 字符）","sessionId":"session-00000000-0000-4000-8000-000000000001"}
+{"at":1791725806670,"kind":"spinning","action":"steer","steerIndex":1,"reason":"最近 40 行只有 10 种内容","detail":{"windowLines":40,"unique":10,"ratio":0.25},"tail":"做。\n好。\n做。\n（执行。）\n做。\n","sessionId":"session-00000000-0000-4000-8000-000000000002"}
+{"at":1791728401002,"kind":"short-line-repeat","action":"steer","steerIndex":2,"reason":"最近 24 行只有 1 种内容","detail":{"windowLines":24,"repeat":24,"sample":"做。"},"tail":"做。\n做。\n做。\n","sessionId":"session-00000000-0000-4000-8000-000000000002"}
+{"at":1791731004550,"kind":"short-line-repeat","action":"cancel","reason":"最近 24 行只有 1 种内容","detail":{"windowLines":24,"repeat":24,"sample":""},"tail":"","sessionId":"session-00000000-0000-4000-8000-000000000003"}

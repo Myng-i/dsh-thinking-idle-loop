@@ -1,0 +1,193 @@
+# 守卫分级反应（先引导、用尽才中止）补丁
+#
+# 目标文件: <DSH_HOME>/profiles/<profile>/node_modules/dsh-attention-health/lib/index.js
+# 基线: dsh-attention-health 当时版本（改动落在三处：import / 常量与两个辅助函数 / 命中分支）
+# 应用: 建议先备份 lib/index.js，再按 hunk 手工合并；本文件同时保留 hunk 头便于 review。
+#
+--- a/node_modules/dsh-attention-health/lib/index.js
++++ b/node_modules/dsh-attention-health/lib/index.js
+@@ -61,6 +61,7 @@
+ import fs from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
++import { randomUUID } from 'node:crypto';
+ 
+ import { z } from 'zod';
+ import {
+@@ -87,6 +88,64 @@
+ /** 落档时保留的思考原文尾部字符数（Q-3）。500 足够看出"当时在重复什么"。 */
+ const GUARD_TAIL_CHARS = 500;
+ 
++/**
++ * 思考空转的**分级反应**（2026-10-24 本机改动，见 AGENTS.md §3.1 补丁位点）。
++ *
++ * 动机：原实现在 `guard.push()` 返回命中时**直接 `agent.cancel()`**。中止会丢掉
++ * 整轮工作，而模型并不知道自己为什么被中止 —— 下一轮从同样的上下文重开，于是
++ * 第 6 / 8 / 11 轮连环中止（实测密度 T1 2.1‰ → T5 13.8‰ → T8 42.6‰）。
++ *
++ * 改法：命中先 `agent.steer()` 注入一条引导（插到下一个 step 边界，不打断当前步），
++ * 并把该 attempt 的守卫**重置**、保留观测；同一 turn 内引导用尽仍复读，才回到原来的
++ * 硬中止。依据：`@argszero/cordis-plugin-thinking-loop-guard` 默认 `escalate: 'steer'`，
++ * 其作者实测「注入的提示成功引导会话继续推进了」。
++ *
++ * ⚠️ `steer` 的入参必须是**带 id 的 message 对象**，不是裸字符串 —— inbox 投影在
++ * `agent/inbox/spliced` 折叠时按 `message.id` 查重（`dsh-agent-loop/lib/index.js`
++ * 的 `inboxProjectionDefinition.apply`）。这里**刻意不 import `createUserMessage`**：
++ * 本插件至今零 `@deepseek-ai/*` 运行时依赖（只有 JSDoc 类型引用），自己拼一个等价
++ * 形状的普通对象即可被 `z.custom()` 接受，也便于 `structuredClone` 落盘。
++ */
++const GUARD_STEER = {
++  /** 同一 turn 内最多注入几次引导（= 允许几个 step 带提醒跑完）；用尽后回到原硬中止。 */
++  maxSteersPerTurn: 3,
++  /**
++   * 单次尝试（= 一个 step）内最多容忍几次命中。
++   *
++   * `steer` 插到 **next-step**，本 step 内模型根本看不到提醒 —— 同一 step 里反复 steer
++   * 只是把多条消息堆进同一个 next-step，毫无作用。所以本 step 第一次命中就注入一次、
++   * 之后只重置窗口不再注入。但若一个 step 里连命中这么多次还没结束，说明它卡在
++   * #5976 那种「只产 reasoning、永不落 text/tool-call」的病理循环里，提醒永远到不了
++   * —— 这时退回硬中止，避免继续烧 token。
++   */
++  maxHitsPerAttempt: 6,
++};
++
++/** 构造一条插件来源的 user message（替代 `createUserMessage`，避免新增运行时依赖）。 */
++function guardSteerMessage(text) {
++  return {
++    id: randomUUID(),
++    role: 'user',
++    content: [{ type: 'text', text }],
++    source: {
++      kind: 'plugin:attention-health',
++      plugin: 'attention-health',
++      form: 'steer',
++      summary: '思考空转引导',
++    },
++  };
++}
++
++/** 引导文本：短、具体、可执行 —— 长了会被正在复读的模型当成新素材一起复述。 */
++function guardSteerText(reason) {
++  return [
++    '（思考守卫提醒）你刚才的思考陷入复读，没有产生新内容。',
++    `判定依据：${reason}。`,
++    '立刻停止复述，直接执行下一步：要么输出一个工具调用，要么给出结论。',
++    '不要再写「做。」这类重复短句。',
++  ].join('\n');
++}
++
+ /** 交接生成路由（前缀路由，实际只应答这一个精确路径）。 */
+ const ROUTE_PATH = '/attention-health/handoff';
+ 
+@@ -1466,13 +1525,28 @@
+   guard('注册思考守卫', () => {
+     /** attemptId → 该次尝试的守卫实例（一次尝试一个，结束即弃）。 */
+     const attempts = new Map();
++    /**
++     * turn → 本 turn 已注入的引导次数（跨 attempt 累计）。
++     * 只按 attempt 计数会失效：一个 turn 有几十个 step，每个 step 换一个 attempt，
++     * 于是「每 attempt 给 3 次机会」等于永不中止。
++     */
++    const steersByTurn = new Map();
+     ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+       try {
+         const key = String(frame?.attemptId ?? '');
+         if (!key) return;
+         if (frame.type === 'start') {
+           // `tail`：这次尝试最近若干字符的思考原文 —— Q-3 要落档的"现场"。
+-          attempts.set(key, { guard: createLoopGuard(GUARD_DEFAULTS), tail: '' });
++          // `turn`：引导次数按 turn 累计（chunk 帧不带 turn，只能在 start 帧记下）。
++          attempts.set(key, {
++            guard: createLoopGuard(GUARD_DEFAULTS),
++            tail: '',
++            turn: frame.turn,
++            /** 本 step 是否已注入过引导（steer 要到 next-step 才被模型看到，本 step 只需一次）。 */
++            steered: false,
++            /** 本 step 累计命中次数（死循环兜底用）。 */
++            hits: 0,
++          });
+           return;
+         }
+         if (frame.type === 'end') {
+@@ -1487,11 +1561,72 @@
+         // Q-3：在内存里保留"现场尾部"，命中时一并落档。
+         slot.tail = (slot.tail + chunk.text).slice(-GUARD_TAIL_CHARS);
+         const hit = slot.guard.push(chunk.text);
++        // 档位 2（提醒）也接出来：原实现定义了 `takeWarn()` 却从未调用，是死代码。
++        // 提醒本身不中止，只留一行日志；是否引导由下面的分级反应统一决定。
++        const warn = typeof slot.guard.takeWarn === 'function' ? slot.guard.takeWarn() : null;
++        if (!hit && warn) {
++          console.error(`[attention-health] 思考疑似复读（继续生成）：${warn.reason}`);
++        }
+         if (!hit) return;
++
++        // ── 分级反应（2026-10-24 本机改动）：先引导，用尽才中止 ───────────────
++        // 原实现在这里直接 cancel。中止丢掉整轮工作，而模型并不知道自己为什么被中止，
++        // 下一轮从同样的上下文重开 —— 实测第 6 / 8 / 11 轮连环中止，密度仍在涨。
++        const turnKey = String(slot.turn ?? 'unknown');
++        const used = steersByTurn.get(turnKey) ?? 0;
++        slot.hits += 1;
++
++        // 情形 A：本 step 尚未注入过，且本 turn 还有机会 → 注入一次引导（模型在下一步看到）
++        if (!slot.steered && used < GUARD_STEER.maxSteersPerTurn) {
++          steersByTurn.set(turnKey, used + 1);
++          try {
++            agent.steer(guardSteerMessage(guardSteerText(hit.reason)));
++          } catch (error) {
++            // steer 不可用（运行时契约可能变化）→ 退回原行为，绝不把这一轮挂死
++            console.error('[attention-health] steer 注入失败，退回中止：', error?.message ?? error);
++            attempts.delete(key);
++            agent.cancel({ kind: 'hook', reason: `attention-health：思考空转 —— ${hit.reason}` });
++            return;
++          }
++          // 重置窗口并保留该 attempt 继续观测：
++          // 不重置的话旧碎片仍在窗口里，下一个 delta 会立刻再命中 —— 连发 steer 等于没救。
++          const sceneTail = slot.tail;
++          slot.steered = true;
++          slot.guard = createLoopGuard(GUARD_DEFAULTS);
++          slot.tail = '';
++          console.error(
++            `[attention-health] 思考空转 → 已注入引导（第 ${steersByTurn.get(turnKey)}/${GUARD_STEER.maxSteersPerTurn} 次，未中止）：${hit.reason}`,
++          );
++          recordGuardTrip({
++            kind: hit.kind,
++            action: 'steer',
++            steerIndex: steersByTurn.get(turnKey),
++            reason: hit.reason,
++            detail: hit.detail,
++            ...shapeGuardTail(sceneTail),
++            sessionId: agent?.sessionId ?? agent?.id ?? null,
++          });
++          return;
++        }
++
++        // 情形 B：本 step 已经注入过（提醒要到下一步才可见）→ 只重置窗口继续观察。
++        // 但一个 step 里连命中太多次，说明它卡在「只产 reasoning、永不落 text/tool-call」
++        // 的病理循环里（#5976），提醒永远到不了 —— 这时落到情形 C 硬中止。
++        // 注意 `slot.steered` 是前置条件：本 turn 机会已用尽时（steered 仍为 false）直接进 C。
++        if (slot.steered && slot.hits < GUARD_STEER.maxHitsPerAttempt) {
++          slot.guard = createLoopGuard(GUARD_DEFAULTS);
++          slot.tail = '';
++          console.error(
++            `[attention-health] 思考空转 → 本步已提醒过，继续观察（本步第 ${slot.hits} 次）：${hit.reason}`,
++          );
++          return;
++        }
++
++        // 情形 C：本 turn 的引导机会用尽，或单个 step 反复命中 → 硬中止
+         attempts.delete(key);
+         const stats = slot.guard.stats();
+         console.error(
+-          `[attention-health] 思考空转 → 中止本轮生成：${hit.reason}` +
++          `[attention-health] 思考空转 → 引导用尽，中止本轮生成：${hit.reason}` +
+             `（累计 ${stats.totalChars.toLocaleString()} 字符 / ${stats.lineCount} 行，` +
+             `kind=${hit.kind} ${JSON.stringify(hit.detail)}）`,
+         );
+@@ -1501,6 +1636,7 @@
+         // 那次误杀的现场就在 65 秒后的重启里被冲掉了（审查清单 Q.1）。
+         recordGuardTrip({
+           kind: hit.kind,
++          action: 'cancel',
+           reason: hit.reason,
+           detail: hit.detail,
+           // Z.5：按当前配置加工尾部 —— 默认保留 500 字；
